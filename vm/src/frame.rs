@@ -123,7 +123,7 @@ impl ExecutionResult {
             Ok(val) => Ok(ExecutionResult::Yield(val)),
             Err(err) => {
                 if err.isinstance(&vm.ctx.exceptions.stop_iteration) {
-                    iterator::stop_iter_value(vm, &err).map(ExecutionResult::Return)
+                    Ok(ExecutionResult::Return(iterator::stop_iter_value(vm, &err)))
                 } else {
                     Err(err)
                 }
@@ -280,7 +280,7 @@ impl FrameRef {
     }
 
     pub fn yield_from_target(&self) -> Option<PyObjectRef> {
-        self.with_exec(|exec| exec.yield_from_target())
+        self.with_exec(|exec| exec.yield_from_target().cloned())
     }
 
     pub fn lasti(&self) -> u32 {
@@ -357,11 +357,11 @@ impl ExecutingFrame<'_> {
         }
     }
 
-    fn yield_from_target(&self) -> Option<PyObjectRef> {
+    fn yield_from_target(&self) -> Option<&PyObjectRef> {
         if let Some(bytecode::Instruction::YieldFrom) =
             self.code.instructions.get(self.lasti() as usize)
         {
-            Some(self.last_value())
+            Some(self.last_value_ref())
         } else {
             None
         }
@@ -375,17 +375,19 @@ impl ExecutingFrame<'_> {
         exc_tb: PyObjectRef,
     ) -> PyResult<ExecutionResult> {
         if let Some(coro) = self.yield_from_target() {
-            let res = match self.builtin_coro(&coro) {
-                Some(coro) => coro.throw(exc_type, exc_val, exc_tb, vm),
-                None => vm.call_method(&coro, "throw", vec![exc_type, exc_val, exc_tb]),
-            };
-            res.or_else(|err| {
-                self.pop_value();
-                self.lasti.fetch_add(1, Ordering::Relaxed);
-                let val = iterator::stop_iter_value(vm, &err)?;
-                self._send(coro, val, vm)
-            })
-            .map(ExecutionResult::Yield)
+            self._throw_gen(coro, exc_type, exc_val, exc_tb, vm)
+                .or_else(|err| {
+                    let coro = self.pop_value();
+                    self.lasti.fetch_add(1, Ordering::Relaxed);
+                    if err.isinstance(&vm.ctx.exceptions.stop_iteration) {
+                        let val = iterator::stop_iter_value(vm, &err);
+                        self._send(&coro, val, vm)
+                    } else {
+                        let (ty, val, tb) = exceptions::split(err, vm);
+                        self._throw_gen(&coro, ty, val, tb, vm)
+                    }
+                })
+                .map(ExecutionResult::Yield)
         } else {
             let exception = exceptions::normalize(exc_type, exc_val, exc_tb, vm)?;
             match self.unwind_blocks(vm, UnwindReason::Raising { exception }) {
@@ -1317,11 +1319,25 @@ impl ExecutingFrame<'_> {
         })
     }
 
-    fn _send(&self, coro: PyObjectRef, val: PyObjectRef, vm: &VirtualMachine) -> PyResult {
-        match self.builtin_coro(&coro) {
+    fn _send(&self, coro: &PyObjectRef, val: PyObjectRef, vm: &VirtualMachine) -> PyResult {
+        match self.builtin_coro(coro) {
             Some(coro) => coro.send(val, vm),
-            None if vm.is_none(&val) => iterator::call_next(vm, &coro),
-            None => vm.call_method(&coro, "send", (val,)),
+            None if vm.is_none(&val) => iterator::call_next(vm, coro),
+            None => vm.call_method(coro, "send", (val,)),
+        }
+    }
+
+    fn _throw_gen(
+        &self,
+        coro: &PyObjectRef,
+        exc_type: PyObjectRef,
+        exc_val: PyObjectRef,
+        exc_tb: PyObjectRef,
+        vm: &VirtualMachine,
+    ) -> PyResult {
+        match self.builtin_coro(coro) {
+            Some(coro) => coro.throw(exc_type, exc_val, exc_tb, vm),
+            None => vm.call_method(coro, "throw", vec![exc_type, exc_val, exc_tb]),
         }
     }
 
@@ -1329,7 +1345,7 @@ impl ExecutingFrame<'_> {
         // Value send into iterator:
         let val = self.pop_value();
 
-        let coro = self.last_value();
+        let coro = self.last_value_ref();
 
         let result = self._send(coro, val, vm);
 
@@ -1682,8 +1698,13 @@ impl ExecutingFrame<'_> {
     }
 
     fn last_value(&self) -> PyObjectRef {
+        self.last_value_ref().clone()
+    }
+
+    #[inline]
+    fn last_value_ref(&self) -> &PyObjectRef {
         match &*self.state.stack {
-            [.., last] => last.clone(),
+            [.., last] => last,
             [] => panic!("tried to get top of stack but stack is empty"),
         }
     }
