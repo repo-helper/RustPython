@@ -253,7 +253,7 @@ mod decl {
     #[cfg(unix)]
     pub(super) mod poll {
         use super::*;
-        use crate::builtins::{PyIntRef, PyTypeRef};
+        use crate::builtins::{PyFloatRef, PyTypeRef};
         use crate::common::lock::PyMutex;
         use crate::function::OptionalArg;
         use crate::pyobject::{BorrowValue, IntoPyObject, PyValue, StaticType};
@@ -333,11 +333,12 @@ mod decl {
             }
 
             #[pymethod]
-            fn poll(&self, timeout: OptionalOption<PyIntRef>, vm: &VirtualMachine) -> PyResult {
+            fn poll(&self, timeout: OptionalOption<PyFloatRef>, vm: &VirtualMachine) -> PyResult {
                 let mut fds = self.fds.lock();
                 let timeout_ms = match timeout.flatten() {
                     Some(ms) => ms
-                        .borrow_value()
+                        .to_f64()
+                        //.borrow_value()
                         .to_i32()
                         .ok_or_else(|| vm.new_overflow_error("timeout is too large".to_owned()))?,
                     None => -1,
